@@ -36,13 +36,21 @@ class PaxosReplica:
         self.accepted: Dict[int, Any] = {}
         self.learned: Dict[int, Any] = {}
         self.log: List[tuple] = []
+        self.alive = True
 
     def on_accept(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
+        if not self.alive:
+            print(f"[PAXOS][{self.replica_name}] NO RESPONSE - CRASHED")
+            return False
         print(f"[PAXOS][{self.replica_name}] ACCEPT({proposal_no}, {operation['op']})")
         self.accepted[proposal_no] = operation
         return True
 
     def on_learn(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
+        if not self.alive:
+            print(f"[PAXOS][{self.replica_name}] NO LEARN - CRASHED")
+            return False
+        
         print(f"[PAXOS][{self.replica_name}] LEARN({proposal_no}, {operation['op']})")
         self.learned[proposal_no] = operation
         self.log.append((proposal_no, operation))
@@ -235,6 +243,12 @@ class DFS:
 
     def _metadata_key(self, filename: str) -> int:
         return self._hash(f"metadata:{filename}")
+    
+    def _metadata_replica_keys(self, filename: str) -> List[int]:
+        return [
+            self._hash(f"metadata:{filename}:replica:{i}")
+            for i in range(3)
+        ]
 
     def _page_key(self, filename: str, page_no: int) -> int:
         return self._hash(f"{filename}:{page_no}")
@@ -255,15 +269,16 @@ class DFS:
             raise PaxosCommitFailed(f"Paxos failed to commit operation: {operation}")
 
     def _get_metadata(self, filename: str) -> Dict[str, Any]:
-        mkey = self._metadata_key(filename)
-        metadata = self._decode(self.chord.get(mkey))
-        if metadata is None:
-            raise FileNotFoundDFS(f"File '{filename}' not found")
-        return metadata
+        for mkey in self._metadata_replica_keys(filename):
+            metadata = self._decode(self.chord.get(mkey))
+            if metadata is not None:
+                return metadata
+
+        raise FileNotFoundDFS(f"File '{filename}' not found")
 
     def _put_metadata(self, metadata: Dict[str, Any]) -> None:
-        mkey = self._metadata_key(metadata["filename"])
-        self.chord.put(mkey, self._encode(metadata))
+        for mkey in self._metadata_replica_keys(metadata["filename"]):
+            self.chord.put(mkey, self._encode(metadata))
 
     def _get_file_index(self) -> List[str]:
         raw = self.chord.get(self.global_index_key)
@@ -288,9 +303,12 @@ class DFS:
         self._put_file_index(files)
 
     def touch(self, filename: str) -> None:
-        mkey = self._metadata_key(filename)
-        if self.chord.get(mkey) is not None:
+        try:
+            self._get_metadata(filename)
             raise FileAlreadyExistsDFS(f"File '{filename}' already exists")
+        except FileNotFoundDFS:
+            pass
+
         self._replicate_update({"op": "touch", "filename": filename})
 
         metadata = {
@@ -301,7 +319,7 @@ class DFS:
             "version": 1
         }
 
-        self.chord.put(mkey, self._encode(metadata))
+        self._put_metadata(metadata)
         self._add_to_file_index(filename)
 
     def append(self, filename: str, local_path: str) -> None:
@@ -403,7 +421,8 @@ class DFS:
         for desc in metadata["pages"]:
             self.chord.delete(desc["guid"])
 
-        self.chord.delete(self._metadata_key(filename))
+        for mkey in self._metadata_replica_keys(filename):
+            self.chord.delete(mkey)
         self._remove_from_file_index(filename)
 
     def ls(self) -> List[str]:
@@ -412,8 +431,11 @@ class DFS:
     def stat(self, filename: str) -> Dict[str, Any]:
         return self._get_metadata(filename)
 
-    def debug_where_is_metadata(self, filename: str) -> ChordNode:
-        return self.chord.locate_successor(self._metadata_key(filename))
+    def debug_where_are_metadata_replicas(self, filename: str) -> List[ChordNode]:
+        return [
+            self.chord.locate_successor(mkey)
+            for mkey in self._metadata_replica_keys(filename)
+        ]
 
     def debug_where_is_page(self, filename: str, page_no: int) -> ChordNode:
         return self.chord.locate_successor(self._page_key(filename, page_no))
@@ -529,8 +551,9 @@ def demo():
     print("\nTAIL 2 LINES:")
     print(dfs.tail("report.txt", 2, by_lines=True).decode("utf-8", errors="replace"))
 
-    owner = dfs.debug_where_is_metadata("report.txt")
-    print(f"Metadata for report.txt is stored at node {owner.node_name} (id={owner.node_id})")
+    print("\nMetadata replicas for report.txt:")
+    for node in dfs.debug_where_are_metadata_replicas("report.txt"):
+        print(f"  stored at node {node.node_name} id={node.node_id}")
 
     page0_owner = dfs.debug_where_is_page("report.txt", 0)
     print(f"Page 0 for report.txt is stored at node {page0_owner.node_name} (id={page0_owner.node_id})")
@@ -569,6 +592,14 @@ def demo():
     keys = [int(line.split(",")[0]) for line in sorted_text.strip().splitlines()]
     assert keys == sorted(keys), "FAIL: not sorted"
     print("\ncorrectness check passed, keys:", keys)
+
+    print("\n=== FAILURE DEMO: replica3 crashes ===")
+    replicas[2].alive = False
+    with open("failure_append.txt", "w", encoding="utf-8") as f:
+        f.write("999,failure-demo\n")
+    dfs.append("records.csv", "failure_append.txt")
+    print("Append still committed with 2/3 Paxos replicas alive.")
+
     paxos.dump_logs()  # PAXOS - add this
 
 
