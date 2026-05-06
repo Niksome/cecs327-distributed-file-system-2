@@ -71,13 +71,20 @@ class PaxosCluster:
         t = self.proposal_no
         majority = len(self.replicas) // 2 + 1
 
-        print(f"[PAXOS][LEADER={self.leader.replica_name}] PROPOSE({t}, {operation})")
+        print(f"[PAXOS][LEADER={self.leader.replica_name}] PROPOSE(op={operation['op']}, t={t})")
 
         accepted_replicas = []
+
         for replica in self.replicas:
             ok = replica.on_accept(t, operation)
             if ok:
                 accepted_replicas.append(replica)
+
+        print(f"[PAXOS] ACCEPTED {len(accepted_replicas)}/{len(self.replicas)}")
+
+        if len(accepted_replicas) < majority:
+            print(f"[PAXOS] ABORT(op={operation['op']}, t={t})")
+            return False
 
         learned_count = 0
         for replica in accepted_replicas:
@@ -85,14 +92,15 @@ class PaxosCluster:
             if ok:
                 learned_count += 1
 
+        print(f"[PAXOS] LEARNED {learned_count}/{len(self.replicas)}")
+
         if learned_count >= majority:
             self.committed.append((t, operation))
-            print(f"[PAXOS][LEADER={self.leader.replica_name}] COMMIT({t}, {operation['op']})")
+            print(f"[PAXOS] COMMIT(op={operation['op']}, t={t})")
             return True
 
-        print(f"[PAXOS][LEADER={self.leader.replica_name}] ABORT({t}, {operation['op']})")
+        print(f"[PAXOS] ABORT(op={operation['op']}, t={t})")
         return False
-
     def dump_logs(self) -> None:
         print("\n=== PAXOS LOGS ===")
         for replica in self.replicas:
@@ -599,7 +607,6 @@ def demo():
         f.write("999,failure-demo\n")
     dfs.append("records.csv", "failure_append.txt")
     print("Append still committed with 2/3 Paxos replicas alive.")
-
     paxos.dump_logs()  # PAXOS - add this
 
 
